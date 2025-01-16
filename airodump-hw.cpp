@@ -28,42 +28,58 @@ void usage() {
 struct MacAddress {
     uint8_t addr[6];
 
-    // Overload the < operator to use MacAddress as a key in std::map
     bool operator<(const MacAddress& other) const {
         return memcmp(this->addr, other.addr, sizeof(this->addr)) < 0;
     }
 };
 
 // Radiotap Header structure
-typedef struct {
-    uint8_t it_version;  /* set to 0 */
-    uint8_t it_pad;
-    uint16_t it_len;     /* entire length */
-    uint32_t it_present; /* fields present */
-} Radiotap_header;
+struct RadiotapHeader {
+    uint8_t version;    // Always 0
+    uint8_t pad;
+    uint16_t length;    // Total length of the radiotap header
+    uint32_t present;   // Bitmask indicating available fields
+};
 
 // Frame Control structure
-typedef struct {
+struct FrameControl {
     uint8_t version : 2;   // Protocol version
     uint8_t type : 2;      // Frame type
     uint8_t subtype : 4;   // Frame subtype
     uint8_t flags;         // Flags (to/from DS, etc.)
-} FrameControl;
+};
+
+// 802.11 Frame structure
+struct Frame80211 {
+    FrameControl fc;
+    uint16_t duration;
+    MacAddress address1;
+    MacAddress address2;
+    MacAddress address3;
+    uint16_t sequence_control;
+    // Followed by frame body (variable length)
+};
+
+// Tagged Parameter structure
+struct TaggedParameter {
+    uint8_t tag_number;
+    uint8_t length;
+    const u_char* value;
+};
 
 // Beacon Packet structure
-typedef struct {
+struct BeaconPacket {
     MacAddress bssid;      // BSSID
     int beacon_count;      // Beacon count
     int data_count;        // Data count
-    char enc[16];          // Encryption type
-    char essid[32];        // ESSID
-    int power;             // Power level
-} BeaconPacket;
+    string encryption;     // Encryption type
+    string essid;          // ESSID
+    int power;             // Signal strength
+};
 
 #pragma pack(pop)
 
-// MAC address printing function
-string mac_to_string(MacAddress mac) {
+string mac_to_string(const MacAddress& mac) {
     char mac_str[18];
     sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
             mac.addr[0], mac.addr[1], mac.addr[2],
@@ -84,26 +100,38 @@ void display_table(const map<MacAddress, BeaconPacket>& beacon_map) {
                  beacon.power,
                  beacon.beacon_count,
                  beacon.data_count,
-                 beacon.enc,
-                 beacon.essid);
+                 beacon.encryption.c_str(),
+                 beacon.essid.c_str());
     }
     mvprintw(row, 0, "--------------------------------------------------------------------------------");
     refresh();
 }
 
-int find_signal_strength(const u_char* radiotap_data, uint32_t it_present, int header_len) {
-    int offset = header_len;
-    for (int i = 0; i < 32; ++i) {
-        if (it_present & (1 << i)) {
-            if (i == 5) { // Signal strength field
-                return (int8_t)radiotap_data[offset];
-            }
-            offset += (i == 0 || i == 1 || i == 2 || i == 3 || i == 4 || i == 5 || i == 8) ? 1 :
-                      (i == 6 || i == 9) ? 2 :
-                      (i == 7 || i == 10) ? 4 : 0;
+TaggedParameter parse_tagged_parameter(const u_char* data) {
+    TaggedParameter param;
+    param.tag_number = data[0];
+    param.length = data[1];
+    param.value = data + 2;
+    return param;
+}
+
+void parse_beacon_frame(const Frame80211* frame, const u_char* tagged_params, BeaconPacket& beacon_packet, size_t frame_length) {
+    beacon_packet.bssid = frame->address3;
+    beacon_packet.essid = "";
+    beacon_packet.encryption = "OPEN";
+
+    const u_char* params_end = tagged_params + frame_length;
+    while (tagged_params < params_end) {
+        TaggedParameter param = parse_tagged_parameter(tagged_params);
+        if (param.tag_number == 0) {
+            beacon_packet.essid = string((const char*)param.value, param.length);
+        } else if (param.tag_number == 48) {
+            beacon_packet.encryption = "WPA2";
+        } else if (param.tag_number == 221) {
+            beacon_packet.encryption = "WPA3";
         }
+        tagged_params += 2 + param.length;
     }
-    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -131,52 +159,21 @@ int main(int argc, char *argv[]) {
         struct pcap_pkthdr *header;
         const u_char *packet;
         int res = pcap_next_ex(pcap, &header, &packet);
-        if (res == 0) continue;
-        if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
-            mvprintw(0, 0, "pcap_next_ex return %d(%s)", res, pcap_geterr(pcap));
-            break;
-        }
+        if (res <= 0) continue;
 
-        Radiotap_header *radiotap = (Radiotap_header *)packet;
-        const u_char *frame = packet + radiotap->it_len;
+        const RadiotapHeader* radiotap = (const RadiotapHeader*)packet;
+        const Frame80211* frame = (const Frame80211*)(packet + radiotap->length);
 
-        FrameControl *fc = (FrameControl *)frame;
+        if (frame->fc.type == 0 && frame->fc.subtype == 8) {
+            BeaconPacket beacon_packet = {};
+            parse_beacon_frame(frame, (const u_char*)frame + sizeof(Frame80211)+12, beacon_packet, header->caplen);
 
-        if (fc->type == 0 && fc->subtype == 8) {
-            BeaconPacket beacon_packet;
-            memset(&beacon_packet, 0, sizeof(beacon_packet));
-
-            memcpy(&beacon_packet.bssid, frame + 16, sizeof(MacAddress));
-            beacon_packet.power = find_signal_strength(packet, radiotap->it_present, radiotap->it_len);
-
-            const u_char *tagged_params = frame + 36;
-
-            uint8_t essid_len = tagged_params[1];
-
-            memcpy(beacon_packet.essid, tagged_params + 2, essid_len);
-            beacon_packet.essid[essid_len] = '\0';
-
-            strcpy(beacon_packet.enc, "OPEN");
-            const u_char *rsn_info = (const u_char *)strstr((const char *)tagged_params, "\x30");
-            if (rsn_info) {
-                strcpy(beacon_packet.enc, "WPA2");
-                if (strstr((const char *)rsn_info, "\x31")) {
-                    strcpy(beacon_packet.enc, "WPA3");
-                }
-            }
-
-            if (beacon_map.find(beacon_packet.bssid) != beacon_map.end()) {
-                beacon_map[beacon_packet.bssid].beacon_count++;
+            auto it = beacon_map.find(beacon_packet.bssid);
+            if (it != beacon_map.end()) {
+                it->second.beacon_count++;
             } else {
                 beacon_packet.beacon_count = 1;
                 beacon_map[beacon_packet.bssid] = beacon_packet;
-            }
-        } else if (fc->type == 2) {
-            MacAddress bssid;
-            memcpy(&bssid, frame + 16, sizeof(MacAddress));
-
-            if (beacon_map.find(bssid) != beacon_map.end()) {
-                beacon_map[bssid].data_count++;
             }
         }
 
