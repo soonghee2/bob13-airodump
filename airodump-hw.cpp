@@ -115,23 +115,45 @@ TaggedParameter parse_tagged_parameter(const u_char* data) {
     return param;
 }
 
-void parse_beacon_frame(const Frame80211* frame, const u_char* tagged_params, BeaconPacket& beacon_packet, size_t frame_length) {
+bool parse_beacon_frame(const Frame80211* frame, const u_char* tagged_params, BeaconPacket& beacon_packet, size_t frame_length) {
     beacon_packet.bssid = frame->address3;
     beacon_packet.essid = "";
     beacon_packet.encryption = "OPEN";
-
+    // printf("parse_becon_frame_start\n");
     const u_char* params_end = tagged_params + frame_length;
     while (tagged_params < params_end) {
         TaggedParameter param = parse_tagged_parameter(tagged_params);
+
         if (param.tag_number == 0) {
-            beacon_packet.essid = string((const char*)param.value, param.length);
+            if (param.length > 0 && param.length <= 32) { // SSID는 최대 32바이트
+            
+                bool valid = true;
+                for (size_t i = 0; i < param.length; i++) {
+                    if (param.value[i] < 32 || param.value[i] > 126) { // Check printable ASCII range
+                        valid = false;
+                        break;
+                    }
+                }
+                if (valid) {
+                    beacon_packet.essid = string((const char*)param.value, param.length);
+                    // printf("Parsed ESSID: %s\n", beacon_packet.essid.c_str());
+                } else {
+                    beacon_packet.essid = "<length" + to_string(param.length) + ">";
+                }
+            } else {
+                return true;
+            }
         } else if (param.tag_number == 48) {
             beacon_packet.encryption = "WPA2";
         } else if (param.tag_number == 221) {
-            beacon_packet.encryption = "WPA3";
+            if (param.length >= 4 && memcmp(param.value, "\x00\x50\xF2\x02", 4) == 0) {
+                beacon_packet.encryption = "WPA3";
+            }
         }
         tagged_params += 2 + param.length;
     }
+    return true;
+
 }
 
 int main(int argc, char *argv[]) {
@@ -167,7 +189,7 @@ int main(int argc, char *argv[]) {
         if (frame->fc.type == 0 && frame->fc.subtype == 8) {
             BeaconPacket beacon_packet = {};
             parse_beacon_frame(frame, (const u_char*)frame + sizeof(Frame80211)+12, beacon_packet, header->caplen);
-
+            
             auto it = beacon_map.find(beacon_packet.bssid);
             if (it != beacon_map.end()) {
                 it->second.beacon_count++;
@@ -176,7 +198,6 @@ int main(int argc, char *argv[]) {
                 beacon_map[beacon_packet.bssid] = beacon_packet;
             }
         }
-
         display_table(beacon_map);
     }
 
