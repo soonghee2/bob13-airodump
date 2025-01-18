@@ -118,15 +118,20 @@ TaggedParameter parse_tagged_parameter(const u_char* data) {
 bool parse_beacon_frame(const Frame80211* frame, const u_char* tagged_params, BeaconPacket& beacon_packet, size_t frame_length) {
     beacon_packet.bssid = frame->address3;
     beacon_packet.essid = "";
-    beacon_packet.encryption = "OPEN";
-    // printf("parse_becon_frame_start\n");
+    beacon_packet.encryption = "OPEN"; // Default encryption
+
     const u_char* params_end = tagged_params + frame_length;
+    bool has_wpa = false;
+    bool has_wpa2 = false;
+    bool has_wpa3 = false;
+
     while (tagged_params < params_end) {
+        if (params_end - tagged_params < 2) break; // Prevent overflow
+
         TaggedParameter param = parse_tagged_parameter(tagged_params);
 
-        if (param.tag_number == 0) {
-            if (param.length > 0 && param.length <= 32) { // SSID는 최대 32바이트
-            
+        if (param.tag_number == 0) { // SSID
+            if (param.length > 0 && param.length <= 32) { // Valid SSID length
                 bool valid = true;
                 for (size_t i = 0; i < param.length; i++) {
                     if (param.value[i] < 32 || param.value[i] > 126) { // Check printable ASCII range
@@ -136,24 +141,57 @@ bool parse_beacon_frame(const Frame80211* frame, const u_char* tagged_params, Be
                 }
                 if (valid) {
                     beacon_packet.essid = string((const char*)param.value, param.length);
-                    // printf("Parsed ESSID: %s\n", beacon_packet.essid.c_str());
                 } else {
                     beacon_packet.essid = "<length" + to_string(param.length) + ">";
                 }
-            } else {
-                return true;
             }
-        } else if (param.tag_number == 48) {
-            beacon_packet.encryption = "WPA2";
-        } else if (param.tag_number == 221) {
-            if (param.length >= 4 && memcmp(param.value, "\x00\x50\xF2\x02", 4) == 0) {
-                beacon_packet.encryption = "WPA3";
+        } else if (param.tag_number == 48) { // RSN Information (WPA2/WPA3)
+            if (param.length >= 2) {
+                has_wpa2 = true;
+
+                // Parse RSN capabilities for WPA3 detection
+                if (param.length >= 4) {
+                    uint16_t rsn_capabilities = param.value[param.length - 2] | (param.value[param.length - 1] << 8);
+                    if (rsn_capabilities & 0x0800) { // Check for SAE support (bit 11)
+                        has_wpa3 = true;
+                    }
+                }
+            }
+        } else if (param.tag_number == 221) { // Vendor Specific (WPA or WPA3)
+            if (param.length >= 6 && memcmp(param.value, "\x00\x50\xF2\x01", 4) == 0) { // WPA OUI
+                has_wpa = true;
             }
         }
-        tagged_params += 2 + param.length;
-    }
-    return true;
 
+        tagged_params += 2 + param.length; // Move to next tag
+    }
+
+    // Determine encryption type
+    if (has_wpa3) {
+        beacon_packet.encryption = "WPA3";
+    } else if (has_wpa2) {
+        beacon_packet.encryption = "WPA2";
+    } else if (has_wpa) {
+        beacon_packet.encryption = "WPA";
+    } else {
+        beacon_packet.encryption = "OPEN";
+    }
+
+    return true;
+}
+
+
+size_t get_radiotap_length(const u_char* packet) {
+    if (!packet) return 0;
+
+    const RadiotapHeader* radiotap = (const RadiotapHeader*)packet;
+
+    // Ensure radiotap header length is valid
+    if (radiotap->length < sizeof(RadiotapHeader)) {
+        return 0; // Invalid radiotap length
+    }
+
+    return radiotap->length;
 }
 
 int main(int argc, char *argv[]) {
@@ -184,7 +222,8 @@ int main(int argc, char *argv[]) {
         if (res <= 0) continue;
 
         const RadiotapHeader* radiotap = (const RadiotapHeader*)packet;
-        const Frame80211* frame = (const Frame80211*)(packet + radiotap->length);
+        // const Frame80211* frame = (const Frame80211*)(packet + radiotap->length);
+        const Frame80211* frame = (const Frame80211*)(packet + get_radiotap_length(packet));
 
         if (frame->fc.type == 0 && frame->fc.subtype == 8) {
             BeaconPacket beacon_packet = {};
